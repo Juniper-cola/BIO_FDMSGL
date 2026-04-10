@@ -345,7 +345,7 @@ def generate_fold_path_data(train_drdi_edges, d_data, args, device='cuda', fold_
 
     print("Validation passed: All path matrices have correct shape for HSGE processing")
     print(f"Using HSGE processor with {generator.total_nodes} nodes")
-    print(f"Architecture mode: {'Unified' if args.unified_hetero_processor else 'Separated'}")
+    print(f"Architecture mode: Unified")
 
     # Prepare data for caching
     data_to_cache = {
