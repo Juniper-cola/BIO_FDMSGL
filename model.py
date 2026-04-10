@@ -135,9 +135,8 @@ class MLPClassifier(nn.Module):
 
 class UnifiedEmbeddingModule(nn.Module):
     """
-    Unified embedding module supporting two HSGE architecture modes:
-    Mode A: Unified HSGE for both heterograph and metapaths
-    Mode B: Separate HSGE for heterograph, shared HSGE for all metapaths
+    Unified embedding module with HSGE architecture:
+    Unified HSGE for both heterograph and metapaths
     """
 
     def __init__(self, args, meta_g, path_names, total_nodes, output_dim, drug_number, disease_number):
@@ -151,8 +150,6 @@ class UnifiedEmbeddingModule(nn.Module):
         self.drug_number = drug_number
         self.disease_number = disease_number
         self.protein_number = total_nodes - drug_number - disease_number
-
-        self.unified_hetero_processor = (args.architecture_mode == 'MODE_A')
 
         # Homogeneous semantic network processors (SpectralSGE with frequency)
         self.drug_homo_sge = SpectralSGE(
@@ -173,49 +170,18 @@ class UnifiedEmbeddingModule(nn.Module):
             freq_max_components=args.freq_max_components
         )
 
-        # HSGE Architecture Configuration
-        if args.architecture_mode == 'MODE_A':
-            # Mode A: Single unified HSGE for both heterograph and metapaths
-            self.unified_hsge = SpectralHSGE(
-                meta_g=meta_g,
-                hsge_out_dim=args.hsge_out_dim,
-                hsge_head=args.hsge_head,
-                hsge_layer=args.hsge_layer,
-                dropout=args.dropout,
-                freq_enhance_ratio=args.freq_enhance_ratio,
-                freq_low_pass_ratio=args.freq_low_pass_ratio,
-                freq_min_components=args.freq_min_components,
-                freq_max_components=args.freq_max_components
-            )
-            self.hetero_hsge = None
-            self.shared_path_hsge = None
-        else:
-            # Mode B: Separate HSGE for heterograph, shared HSGE for all metapaths
-            self.hetero_hsge = SpectralHSGE(
-                meta_g=meta_g,
-                hsge_out_dim=args.hsge_out_dim,
-                hsge_head=args.hsge_head,
-                hsge_layer=args.hsge_layer,
-                dropout=args.dropout,
-                freq_enhance_ratio=args.freq_enhance_ratio,
-                freq_low_pass_ratio=args.freq_low_pass_ratio,
-                freq_min_components=args.freq_min_components,
-                freq_max_components=args.freq_max_components
-            )
-
-            self.shared_path_hsge = SpectralHSGE(
-                meta_g=meta_g,
-                hsge_out_dim=args.path_hsge_out_dim,
-                hsge_head=args.path_hsge_head,
-                hsge_layer=args.path_hsge_layer,
-                dropout=args.dropout,
-                freq_enhance_ratio=args.freq_enhance_ratio,
-                freq_low_pass_ratio=args.freq_low_pass_ratio,
-                freq_min_components=args.freq_min_components,
-                freq_max_components=args.freq_max_components
-            )
-
-            self.unified_hsge = None
+        # HSGE Architecture: Unified HSGE for both heterograph and metapaths
+        self.unified_hsge = SpectralHSGE(
+            meta_g=meta_g,
+            hsge_out_dim=args.hsge_out_dim,
+            hsge_head=args.hsge_head,
+            hsge_layer=args.hsge_layer,
+            dropout=args.dropout,
+            freq_enhance_ratio=args.freq_enhance_ratio,
+            freq_low_pass_ratio=args.freq_low_pass_ratio,
+            freq_min_components=args.freq_min_components,
+            freq_max_components=args.freq_max_components
+        )
 
         # Feature transformation layers for metapaths
         self.path_feature_transforms = None
@@ -227,11 +193,7 @@ class UnifiedEmbeddingModule(nn.Module):
     def _init_dimension_adapters(self):
         """Initialize dimension adapters to avoid dynamic parameter creation"""
         homo_dim = self.args.sge_out_dim
-
-        if self.args.architecture_mode == 'MODE_A':
-            path_dim = self.args.hsge_out_dim
-        else:
-            path_dim = self.args.path_hsge_out_dim
+        path_dim = self.args.hsge_out_dim
 
         self.drug_adapters = nn.ModuleDict()
         for path in self.path_names:
@@ -251,10 +213,7 @@ class UnifiedEmbeddingModule(nn.Module):
 
     def forward_hetero_graph(self, heterograph, feature, node_types, edge_types):
         """Process heterogeneous regulatory network"""
-        if self.args.architecture_mode == 'MODE_A':
-            return self.unified_hsge(heterograph, feature, node_types, edge_types)
-        else:
-            return self.hetero_hsge(heterograph, feature, node_types, edge_types)
+        return self.unified_hsge(heterograph, feature, node_types, edge_types)
 
     def forward_path_graphs(self, path_data, drug_feature, disease_feature, protein_feature):
         """Process path-guided networks using HSGE only (no SGE option)"""
@@ -295,18 +254,12 @@ class UnifiedEmbeddingModule(nn.Module):
                 node_types = torch.zeros(num_nodes, dtype=torch.long, device=device)
                 edge_types = torch.zeros(num_edges, dtype=torch.long, device=device)
 
-                # Use appropriate SpectralHSGE based on architecture mode
-                if self.args.architecture_mode == 'MODE_A':
-                    embedding = self.unified_hsge(dgl_graph, initial_features, node_types, edge_types)
-                else:
-                    embedding = self.shared_path_hsge(dgl_graph, initial_features, node_types, edge_types)
+                # Use unified SpectralHSGE
+                embedding = self.unified_hsge(dgl_graph, initial_features, node_types, edge_types)
 
                 path_embeddings[path] = embedding
             else:
-                if self.args.architecture_mode == 'MODE_A':
-                    embedding_dim = self.args.hsge_out_dim
-                else:
-                    embedding_dim = self.args.path_hsge_out_dim
+                embedding_dim = self.args.hsge_out_dim
                 path_embeddings[path] = torch.zeros(self.total_nodes, embedding_dim).to(device)
 
         return path_embeddings
@@ -331,8 +284,8 @@ class MSGL(nn.Module):
         self.concat_drug = nn.Linear(args.hsge_out_dim * 3, args.hsge_out_dim)
         self.concat_disease = nn.Linear(args.hsge_out_dim * 3, args.hsge_out_dim)
 
-        # Create unified node embedding for paths with correct dimension
-        path_embedding_dim = args.hsge_out_dim if args.architecture_mode == 'MODE_A' else args.path_hsge_out_dim
+        # Create unified node embedding for paths
+        path_embedding_dim = args.hsge_out_dim
         self.path_node_embedding = nn.Embedding(total_nodes, path_embedding_dim)
         nn.init.xavier_uniform_(self.path_node_embedding.weight)
 
@@ -342,7 +295,7 @@ class MSGL(nn.Module):
             meta_g=meta_g,
             path_names=args.path_list,
             total_nodes=total_nodes,
-            output_dim=args.hsge_out_dim if args.architecture_mode == 'MODE_A' else args.path_hsge_out_dim,
+            output_dim=args.hsge_out_dim,
             drug_number=drug_number,
             disease_number=disease_number
         )
