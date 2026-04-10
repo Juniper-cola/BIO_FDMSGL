@@ -1,0 +1,380 @@
+# -*- coding: utf-8 -*-
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import dgl
+import dgl.function as fn
+import numpy as np
+
+
+class SpectralSGELayer(nn.Module):
+    """
+    Spectral version of SGELayer - maintains exact same interface as original SGELayer
+    Only computation is moved to frequency domain
+    """
+
+    def __init__(self, in_dim, out_dim, num_heads, dropout=0.0, layer_norm=False, batch_norm=True, residual=True,
+                 use_bias=False,
+                 freq_enhance_ratio=0.1, freq_low_pass_ratio=0.25, freq_min_components=32, freq_max_components=128,
+                 device=None):
+        super(SpectralSGELayer, self).__init__()
+
+        if device is None:
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = device
+
+        self.in_channels = in_dim
+        self.out_channels = out_dim
+        self.num_heads = num_heads
+        self.dropout = dropout
+        self.residual = residual
+        self.layer_norm = layer_norm
+        self.batch_norm = batch_norm
+
+        # Frequency domain parameters
+        self.freq_enhance_ratio = freq_enhance_ratio
+        self.freq_low_pass_ratio = freq_low_pass_ratio
+        self.freq_min_components = freq_min_components
+        self.freq_max_components = freq_max_components
+
+        # Same structure as original SGELayer
+        self.Q = nn.Linear(in_dim, out_dim * num_heads, bias=use_bias).to(self.device)
+        self.K = nn.Linear(in_dim, out_dim * num_heads, bias=use_bias).to(self.device)
+        self.V = nn.Linear(in_dim, out_dim * num_heads, bias=use_bias).to(self.device)
+
+        self.O = nn.Linear(out_dim, out_dim).to(self.device)
+
+        if self.layer_norm:
+            self.layer_norm1 = nn.LayerNorm(out_dim).to(self.device)
+
+        if self.batch_norm:
+            self.batch_norm1 = nn.BatchNorm1d(out_dim).to(self.device)
+
+        self.FFN_layer1 = nn.Linear(out_dim, out_dim * 2).to(self.device)
+        self.FFN_layer2 = nn.Linear(out_dim * 2, out_dim).to(self.device)
+
+        if self.layer_norm:
+            self.layer_norm2 = nn.LayerNorm(out_dim).to(self.device)
+
+        if self.batch_norm:
+            self.batch_norm2 = nn.BatchNorm1d(out_dim).to(self.device)
+
+    def compute_laplacian(self, adj_matrix):
+        """Compute normalized Laplacian matrix"""
+        device = adj_matrix.device
+        adj_matrix = adj_matrix.float().to(device)
+        adj_matrix = adj_matrix + torch.eye(adj_matrix.size(0), device=device)
+
+        degree = torch.sum(adj_matrix, dim=1)
+        degree = torch.where(degree > 0, degree, torch.ones_like(degree))
+
+        degree_sqrt_inv = torch.pow(degree, -0.5)
+        degree_sqrt_inv = torch.diag(degree_sqrt_inv)
+
+        normalized_adj = torch.mm(torch.mm(degree_sqrt_inv, adj_matrix), degree_sqrt_inv)
+        laplacian = torch.eye(adj_matrix.size(0), device=device) - normalized_adj
+
+        # Add regularization for numerical stability
+        laplacian = laplacian + 1e-6 * torch.eye(laplacian.size(0), device=device)
+
+        return laplacian
+
+    def spatial_to_frequency_and_back(self, g, h):
+        adj_matrix = g.adjacency_matrix().to_dense().to(h.device)
+        if adj_matrix.size(0) < 2:
+            return h
+
+        L = self.compute_laplacian(adj_matrix)
+        eigenvals, eigenvecs = torch.linalg.eigh(L)
+
+        total_components = eigenvals.shape[0]
+        min_components = min(self.freq_min_components, total_components)
+        max_components = min(self.freq_max_components, total_components)
+
+        keep_components = max(
+            min_components,
+            min(max_components, int(total_components * self.freq_low_pass_ratio))
+        )
+        keep_components = min(keep_components, total_components)
+
+        freq_basis = eigenvecs[:, :keep_components].to(h.device)
+        freq_h = torch.mm(freq_basis.T, h)  # [keep_components, feat_dim]
+
+        Q_freq = self.Q(freq_h)
+        K_freq = self.K(freq_h)
+        V_freq = self.V(freq_h)
+
+        seq_len = freq_h.size(0)  # keep_components
+        Q_freq = Q_freq.contiguous().view(seq_len, self.num_heads, self.out_channels)
+        K_freq = K_freq.contiguous().view(seq_len, self.num_heads, self.out_channels)
+        V_freq = V_freq.contiguous().view(seq_len, self.num_heads, self.out_channels)
+
+        scores = torch.einsum('qhd,khd->qkh', Q_freq, K_freq) / (self.out_channels ** 0.5)
+        attn_weights = F.softmax(scores, dim=1)
+        attn_weights = F.dropout(attn_weights, self.dropout, training=self.training)
+
+        head_out = torch.einsum('qkh,khd->qhd', attn_weights, V_freq)  # [seq_len, num_heads, out_channels]
+        head_out = head_out.mean(dim=1)  # [seq_len, out_channels]
+
+        freq_output = self.O(head_out)
+        spatial_output = torch.mm(freq_basis, freq_output)
+
+        alpha = torch.clamp(torch.tensor(self.freq_enhance_ratio, device=h.device), 0, 1)
+        enhanced_h = (1 - alpha) * h + alpha * spatial_output
+
+        return enhanced_h
+
+    def forward(self, g, h):
+        h = h.to(self.device)
+        h_in1 = h
+
+        # Spectral attention (replaces original attention)
+        attn_out = self.spatial_to_frequency_and_back(g, h)
+        h = attn_out
+
+        h = F.dropout(h, self.dropout, training=self.training)
+
+        if self.residual:
+            h = h_in1 + h
+
+        if self.layer_norm:
+            h = self.layer_norm1(h)
+
+        if self.batch_norm:
+            h = self.batch_norm1(h)
+
+        h_in2 = h
+
+        # Same FFN as original
+        h = self.FFN_layer1(h)
+        h = F.relu(h)
+        h = F.dropout(h, self.dropout, training=self.training)
+        h = self.FFN_layer2(h)
+
+        if self.residual:
+            h = h_in2 + h
+
+        if self.layer_norm:
+            h = self.layer_norm2(h)
+
+        if self.batch_norm:
+            h = self.batch_norm2(h)
+
+        return h
+
+
+class SpectralSGE(nn.Module):
+    """
+    Spectral version of SGE - maintains exact same interface as original SGE
+    Only replaces SGELayer with SpectralSGELayer
+    """
+
+    def __init__(self, device, n_layers, node_dim, hidden_dim, out_dim, n_heads, dropout,
+                 freq_enhance_ratio=0.1, freq_low_pass_ratio=0.25,
+                 freq_min_components=32, freq_max_components=128):
+        super(SpectralSGE, self).__init__()
+
+        if isinstance(device, str):
+            device = torch.device(device)
+        self.device = device
+        self.layer_norm = True
+        self.batch_norm = False
+        self.residual = True
+
+        # Same input projection as original SGE
+        self.linear_h = nn.Linear(node_dim, hidden_dim).to(self.device)
+
+        # Replace SGELayer with SpectralSGELayer
+        self.layers = nn.ModuleList([
+            SpectralSGELayer(hidden_dim, hidden_dim, n_heads, dropout, self.layer_norm, self.batch_norm, self.residual,
+                             freq_enhance_ratio=freq_enhance_ratio, freq_low_pass_ratio=freq_low_pass_ratio,
+                             freq_min_components=freq_min_components, freq_max_components=freq_max_components,
+                             device=self.device)
+            for _ in range(n_layers - 1)
+        ])
+
+        self.layers.append(
+            SpectralSGELayer(hidden_dim, out_dim, n_heads, dropout, self.layer_norm, self.batch_norm, self.residual,
+                             freq_enhance_ratio=freq_enhance_ratio, freq_low_pass_ratio=freq_low_pass_ratio,
+                             freq_min_components=freq_min_components, freq_max_components=freq_max_components,
+                             device=self.device))
+
+    def forward(self, g):
+        g = g.to(self.device)
+        h = g.ndata['sim_feature'].float().to(self.device)
+
+        # Same processing as original SGE
+        h = self.linear_h(h.to(self.device))
+        for conv in self.layers:
+            h = conv(g, h)
+
+        g.ndata['h'] = h
+
+        return h
+
+
+class SpectralHGTConv(nn.Module):
+    """
+    Spectral version of HGTConv - maintains exact same interface as original HGTConv
+    Only computation is moved to frequency domain
+    """
+
+    def __init__(self, in_size, head_size, num_heads, num_ntypes, num_etypes, dropout=0.0,
+                 freq_enhance_ratio=0.1, freq_low_pass_ratio=0.25, freq_min_components=32, freq_max_components=128,
+                 device=None):
+        super(SpectralHGTConv, self).__init__()
+
+        if device is None:
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = device
+
+        self.in_size = in_size
+        self.head_size = head_size
+        self.num_heads = num_heads
+        self.sqrt_d = (head_size) ** 0.5
+        self.dropout = dropout
+
+        # Frequency domain parameters
+        self.freq_enhance_ratio = freq_enhance_ratio
+        self.freq_low_pass_ratio = freq_low_pass_ratio
+        self.freq_min_components = freq_min_components
+        self.freq_max_components = freq_max_components
+
+        # Same linear projections as original HGTConv
+        self.k_linear = nn.Linear(in_size, head_size * num_heads).to(self.device)
+        self.q_linear = nn.Linear(in_size, head_size * num_heads).to(self.device)
+        self.v_linear = nn.Linear(in_size, head_size * num_heads).to(self.device)
+        self.a_linear = nn.Linear(head_size * num_heads, in_size).to(self.device)
+        self.skip = nn.Parameter(torch.ones(num_ntypes, device=self.device))
+
+    def compute_laplacian(self, adj_matrix):
+        """Compute normalized Laplacian matrix"""
+        device = adj_matrix.device
+        adj_matrix = adj_matrix.float().to(device)
+        adj_matrix = adj_matrix + torch.eye(adj_matrix.size(0), device=device)
+
+        degree = torch.sum(adj_matrix, dim=1)
+        degree = torch.where(degree > 0, degree, torch.ones_like(degree))
+
+        degree_sqrt_inv = torch.pow(degree, -0.5)
+        degree_sqrt_inv = torch.diag(degree_sqrt_inv)
+
+        normalized_adj = torch.mm(torch.mm(degree_sqrt_inv, adj_matrix), degree_sqrt_inv)
+        laplacian = torch.eye(adj_matrix.size(0), device=device) - normalized_adj
+
+        # Add regularization for numerical stability
+        laplacian = laplacian + 1e-6 * torch.eye(laplacian.size(0), device=device)
+
+        return laplacian
+
+    def spectral_message_passing(self, g, h):
+        """Message passing in frequency domain"""
+        h = h.to(self.device)
+        adj_matrix = g.adjacency_matrix().to_dense().to(h.device)
+
+        # Handle small graphs
+        if adj_matrix.size(0) < 2:
+            return h
+
+        L = self.compute_laplacian(adj_matrix)
+        eigenvals, eigenvecs = torch.linalg.eigh(L)
+
+        # Determine frequency components
+        total_components = eigenvals.shape[0]
+        min_components = min(self.freq_min_components, total_components)
+        max_components = min(self.freq_max_components, total_components)
+
+        keep_components = max(
+            min_components,
+            min(max_components, int(total_components * self.freq_low_pass_ratio))
+        )
+        keep_components = min(keep_components, total_components)
+
+        # Project to frequency domain
+        freq_basis = eigenvecs[:, :keep_components].to(h.device)
+        freq_h = torch.mm(freq_basis.T, h)  # [keep_components, feat_dim]
+
+        # HGT-style processing in frequency domain
+        seq_len = freq_h.size(0)  # keep_components
+
+        k = self.k_linear(freq_h).contiguous().view(seq_len, self.num_heads, self.head_size)
+        q = self.q_linear(freq_h).contiguous().view(seq_len, self.num_heads, self.head_size)
+        v = self.v_linear(freq_h).contiguous().view(seq_len, self.num_heads, self.head_size)
+
+        # Attention in frequency domain
+        attention = torch.einsum('qhd,khd->qkh', q, k) / self.sqrt_d
+        attention = F.softmax(attention, dim=1)
+        attention = F.dropout(attention, self.dropout, training=self.training)
+
+        # Message aggregation in frequency domain
+        message = torch.einsum('qkh,khd->qhd', attention, v)
+        message = message.contiguous().view(seq_len, self.num_heads * self.head_size)
+
+        # Output projection
+        freq_output = self.a_linear(message)
+
+        # Transform back to spatial domain
+        spatial_output = torch.mm(freq_basis, freq_output)
+
+        # Adaptive mixing
+        alpha = torch.clamp(torch.tensor(self.freq_enhance_ratio, device=h.device), 0, 1)
+        enhanced_h = (1 - alpha) * h + alpha * spatial_output
+
+        return enhanced_h
+
+    def forward(self, g, h, ntype, etype, *, presorted=False):
+        """Same interface as original HGTConv"""
+        with g.local_scope():
+            # Use spectral message passing instead of original HGT message passing
+            return self.spectral_message_passing(g, h)
+
+
+class SpectralHSGE(nn.Module):
+    """
+    Spectral version of HSGEWrapper - maintains exact same interface as original HSGEWrapper
+    Only replaces HGTConv with SpectralHGTConv
+    """
+
+    def __init__(self, meta_g, hsge_out_dim, hsge_head, hsge_layer, dropout,
+                 freq_enhance_ratio=0.1, freq_low_pass_ratio=0.25,
+                 freq_min_components=32, freq_max_components=128, device=None):
+        super(SpectralHSGE, self).__init__()
+
+        if device is None:
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = device
+
+        self.hsge_out_dim = hsge_out_dim
+        self.hsge_head = hsge_head
+        self.hsge_layer = hsge_layer
+
+        # Replace HGTConv with SpectralHGTConv
+        self.hsge_dgl = SpectralHGTConv(
+            hsge_out_dim, int(hsge_out_dim / hsge_head),
+            hsge_head, len(meta_g.nodes()), len(meta_g.edges()),
+            dropout,
+            freq_enhance_ratio=freq_enhance_ratio,
+            freq_low_pass_ratio=freq_low_pass_ratio,
+            freq_min_components=freq_min_components,
+            freq_max_components=freq_max_components,
+            device=self.device
+        )
+
+        # Same structure as original HSGEWrapper - multiple layers of the same conv
+        self.hsge_layers = nn.ModuleList()
+        for _ in range(hsge_layer):
+            self.hsge_layers.append(self.hsge_dgl)
+
+    def forward(self, g, feature, node_types, edge_types, apply_frequency_pre=True, apply_frequency_inter=False):
+        """Same interface as original HSGEWrapper"""
+        # Ensure all inputs are on the correct device
+        g = g.to(self.device)
+        feature = feature.to(self.device)
+        node_types = node_types.to(self.device)
+        edge_types = edge_types.to(self.device)
+
+        # Same processing as original HSGEWrapper
+        for i, layer in enumerate(self.hsge_layers):
+            feature = layer(g, feature, node_types, edge_types, presorted=True)
+
+        return feature
