@@ -32,7 +32,7 @@ def setup_logging(args):
 
     processor_config = f"SpectralSGE_SpectralHSGE_{args.path_processor.upper()}"
 
-    arch_info = "UNIFIED" if args.architecture_mode == 'MODE_A' else "SEPARATE"
+    arch_info = "UNIFIED"
 
     log_filename = 'logs/train_DDA_{}_{}_SPECTRAL_{}_{}.log'.format(
         args.dataset, processor_config, arch_info, timestamp
@@ -64,7 +64,7 @@ def setup_logging(args):
     logger.info("  Homogeneous Semantic Network Processor: SpectralSGE")
     logger.info("  Path-guided Network Processor: SpectralHSGE")
     logger.info(
-        "  Heterogeneous Architecture Mode: {}".format("Unified" if args.architecture_mode == 'MODE_A' else "Separated"))
+        "  Heterogeneous Architecture Mode: Unified")
     logger.info("  Classifier Type: MLP")
     logger.info("  Decoder Type: {}".format(args.decoder_type))
 
@@ -75,15 +75,9 @@ def setup_logging(args):
     logger.info("  Component Range: {}-{}".format(args.freq_min_components, args.freq_max_components))
 
     logger.info("HETEROGENEOUS PROCESSING ARCHITECTURE:")
-    if args.architecture_mode == 'MODE_A':
-        logger.info("  Mode: Unified Processing")
-        logger.info("  Description: Single SpectralHSGE for both heterograph and metapaths")
-        logger.info("  Metapath Processor: Unified SpectralHSGE")
-    else:
-        logger.info("  Mode: Separated Processing")
-        logger.info("  Description: Separate processors for heterograph and metapaths")
-        logger.info("  Heterograph Processor: Dedicated SpectralHSGE")
-        logger.info("  Metapath Processor: Shared SpectralHSGE for all paths")
+    logger.info("  Mode: Unified Processing")
+    logger.info("  Description: Single SpectralHSGE for both heterograph and metapaths")
+    logger.info("  Metapath Processor: Unified SpectralHSGE")
 
     logger.info("=" * 80)
 
@@ -171,7 +165,7 @@ def train_mlp(model, drdr_graph, didi_graph, drdipr_graph, drug_feature, disease
     best_aupr = 0.0
     epoch_start_time = time.time()
 
-    arch_status = "UNIFIED" if args.architecture_mode == 'MODE_A' else "SEPARATE"
+    arch_status = "UNIFIED"
 
     pbar = tqdm(range(args.total_epochs),
                 desc="Fold {} MSGL Training (SpectralSGE+SpectralHSGE, SPECTRAL, {})".format(
@@ -308,7 +302,7 @@ if __name__ == "__main__":
     logger.info("  - Path-guided Networks: SpectralHSGE")
     logger.info("  - Heterogeneous Regulatory Network: SpectralHSGE")
     logger.info(
-        "  - Heterogeneous Processing Mode: {}".format("Unified" if args.architecture_mode == 'MODE_A' else "Separated"))
+        "  - Heterogeneous Processing Mode: Unified")
     logger.info("  - Paths: {}".format(args.path_list))
     logger.info("  - Classifier: MLP")
     logger.info("  - Frequency Processing: Native (always enabled)")
@@ -323,8 +317,7 @@ if __name__ == "__main__":
         print("\n{}".format("=" * 70))
         print("FOLD {}/{} - MSGL Framework".format(fold_i + 1, args.K_fold))
         print("  Semantic: SpectralSGE | Path-guided: SpectralHSGE | Regulatory: SpectralHSGE")
-        print("  Architecture: {} | Frequency: Native".format(
-            "Unified" if args.architecture_mode == 'MODE_A' else "Separated"))
+        print("  Architecture: Unified | Frequency: Native")
         print("  Contrastive: Semantic-Regulatory Alignment")
         print("{}".format("=" * 70))
 
@@ -396,7 +389,7 @@ if __name__ == "__main__":
         logger.info("Fold {} Model Architecture Details:".format(fold_i + 1))
         logger.info("  - Frequency Processing: Native (SpectralSGE/SpectralHSGE)")
         logger.info(
-            "  - Heterogeneous Processing: {}".format("Unified" if args.architecture_mode == 'MODE_A' else "Separated"))
+            "  - Heterogeneous Processing: Unified")
         logger.info("  - Path Processor: SpectralHSGE")
 
         fold_best_result = train_mlp(model, drdr_graph, didi_graph, heterograph,
@@ -451,7 +444,7 @@ if __name__ == "__main__":
     print("{}".format("=" * 70))
     print("Dataset: {}".format(args.dataset))
     print("Architecture: SpectralSGE + SpectralHSGE + SpectralHSGE")
-    print("Heterogeneous Mode: {}".format("Unified" if args.architecture_mode == 'MODE_A' else "Separated"))
+    print("Heterogeneous Mode: Unified")
     print("Frequency Processing: Native (always enabled)")
     print("  - Enhancement Ratio: {}".format(args.freq_enhance_ratio))
     print("  - Low-pass Filter Ratio: {}".format(args.freq_low_pass_ratio))
