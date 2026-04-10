@@ -72,8 +72,8 @@ argparser.add_argument('--freq_max_components', type=int, default=128,
                        help='maximum number of frequency components to keep')
 
 argparser.add_argument('--architecture_mode', type=str, default='MODE_A',
-                       choices=['MODE_A', 'MODE_B'],
-                       help='MODE_A: unified HSGE for both heterograph and metapaths; MODE_B: separate HSGE for heterograph, shared HSGE for metapaths')
+                       choices=['MODE_A'],
+                       help='MODE_A: unified HSGE for both heterograph and metapaths')
 
 argparser.add_argument('--dropout', default=0.4, type=float, help='dropout')
 
@@ -129,21 +129,15 @@ if not hasattr(args, 'hsge_in_dim'):
     args.hsge_in_dim = args.hsge_out_dim
 args.path_processor = 'hsge'
 
-args.unified_hetero_processor = (args.architecture_mode == 'MODE_A')
+args.unified_hetero_processor = True
 
-if args.architecture_mode == 'MODE_A':
-    args.path_hsge_out_dim = args.hsge_out_dim
-    args.path_hsge_layer = args.hsge_layer
-    args.path_hsge_head = args.hsge_head
-    print("Architecture Mode: A (Unified HSGE)")
-    print("  - Single HSGE processes both heterograph and all metapaths")
-    print("  - Parameter sharing between heterograph and metapath processing")
-    print("  - HSGE dimensions: {}".format(args.hsge_out_dim))
-elif args.architecture_mode == 'MODE_B':
-    print("Architecture Mode: B (Separated HSGE)")
-    print("  - Heterograph HSGE dimensions: {}".format(args.hsge_out_dim))
-    print("  - Shared metapath HSGE dimensions: {}".format(args.path_hsge_out_dim))
-    print("  - All metapaths share the same HSGE parameters")
+args.path_hsge_out_dim = args.hsge_out_dim
+args.path_hsge_layer = args.hsge_layer
+args.path_hsge_head = args.hsge_head
+print("Architecture Mode: A (Unified HSGE)")
+print("  - Single HSGE processes both heterograph and all metapaths")
+print("  - Parameter sharing between heterograph and metapath processing")
+print("  - HSGE dimensions: {}".format(args.hsge_out_dim))
 
 if args.freq_enhance_ratio < 0 or args.freq_enhance_ratio > 1:
     raise ValueError("freq_enhance_ratio must be between 0 and 1")
@@ -163,6 +157,5 @@ print("Final Architecture Configuration:")
 print("  - Homogeneous Semantic Networks: SpectralSGE (native frequency domain)")
 print("  - Heterogeneous Regulatory Network: SpectralHSGE (native frequency domain)")
 print("  - Path-guided Networks: SpectralHSGE (native frequency domain)")
-print("  - Metapath Processing: {} SpectralHSGE mode".format(
-    "Unified" if args.architecture_mode == 'MODE_A' else "Shared Separate"))
+print("  - Metapath Processing: Unified SpectralHSGE mode")
 print("  - Contrastive Learning: Semantic-Regulatory Alignment")
